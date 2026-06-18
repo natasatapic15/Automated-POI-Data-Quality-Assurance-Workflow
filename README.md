@@ -35,6 +35,14 @@ graph TD
     
 ```
 
+1. Schedule Trigger — runs weekly.
+2. HTTP Request (Overpass API) — sends your OverpassQL to https://overpass-api.de/api/interpreter, returns NYC restaurant POIs as JSON.
+3. Code node (prep) — flattens the Overpass elements into clean {id, lat, lon, name} rows.
+4. Execute Command (Python / DBSCAN) — runs your scikit-learn clustering, detects spatial anomalies, returns results as JSON.
+5. Code node (report) — formats the anomaly findings into a mini report (text + counts).
+6. GitHub node — commits the output file to your repo (natasatapic15/Automated-POI-Data-Quality-Assurance-Workflow).
+7. Slack node — posts the mini report to a channel.
+
 ## DBSCAN Analysis 
 
 DBSCAN was selected over centroid-based clustering algorithms like K-Means because it automatically discovers clusters of varying shapes and densities while natively detecting anomalous data points without requiring a predefined cluster count
