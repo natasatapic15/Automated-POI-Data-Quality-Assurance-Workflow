@@ -18,30 +18,32 @@ Additionally, this analysis can be used to gain **business insights**, as it can
 
 ---
 
-## System Architecture
 
-The pipeline operates as a fully automated data workflow, shifting data quality checks from a reactive manual process to a proactive, real-time operation.
+## Pipeline
+
+1. **Weekly Trigger** — runs every Monday at 06:00.
+2. **Fetch NYC Restaurants (Overpass)** — POSTs `overpass-query.overpassql` to
+   `https://overpass-api.de/api/interpreter`.
+3. **DBSCAN Anomaly Detection** — clusters POIs with the Haversine metric
+   (eps = 100 m, min_samples = 5); noise points (cluster `-1`) are anomalies.
+4. **Build Report** — formats results into a markdown report + Slack message.
+5. **Commit Report to GitHub** — commits to `reports/poi-anomalies-<date>.md`.
+6. **Post Report to Slack** — posts a mini report to `#data-quality-alerts`.
 
 ```mermaid
-graph TD
-    A[Schedule Trigger] --> B[n8n HTTP Request Node]
-    B -->|Fetch POI Data via Overpass QL| C[OpenStreetMap Overpass API]
-    C -->|Raw JSON Payload| D[n8n Execute Command Node]
-    D -->|Execute Script| E[Python DBSCAN Engine]
-    E -->|Isolate Spatial Noise Cluster -1| F{"Anomalies Detected?"}
-    F -->|Yes| G[n8n Escalation Logic]
-    F -->|No| H[Process Completed Successfully]
-    G -->|Automated Alert| I[Slack Engineering Channel] 
-    
+flowchart LR
+    A[Weekly Trigger<br/>Mon 06:00]
+    B[Fetch NYC Restaurants<br/>Overpass API]
+    C[DBSCAN Anomaly Detection<br/>eps=100m, min_samples=5]
+    D[Build Report]
+    E[Commit Report<br/>reports/poi-anomalies-&lt;date&gt;.md]
+    F[Post to Slack<br/>#data-quality-alerts]
+
+    A --> B --> C --> D --> E
+    D --> F
 ```
 
-1. Schedule Trigger — runs weekly.
-2. HTTP Request (Overpass API) — sends your OverpassQL to https://overpass-api.de/api/interpreter, returns NYC restaurant POIs as JSON.
-3. Code node (prep) — flattens the Overpass elements into clean {id, lat, lon, name} rows.
-4. Execute Command (Python / DBSCAN) — runs your scikit-learn clustering, detects spatial anomalies, returns results as JSON.
-5. Code node (report) — formats the anomaly findings into a mini report (text + counts).
-6. GitHub node — commits the output file to your repo (natasatapic15/Automated-POI-Data-Quality-Assurance-Workflow).
-7. Slack node — posts the mini report to a channel.
+
 
 ## DBSCAN Analysis 
 
@@ -52,8 +54,19 @@ Parameters:
 
 2. MinSamples: Set to 5 points to establish a statistically valid spatial cluster.
 
+## Why two DBSCAN versions?
+
+The Python version uses **scikit-learn**, which **cannot run inside an n8n Cloud Code node** (the Pyodide sandbox has no scikit-learn), and **Execute Command is disabled on n8n Cloud**. The live workflow therefore uses an equivalent pure-JavaScript port (`dbscan_anomaly_detection.js`) with identical parameters and output. Keep the `.py` file as the reference implementation or for a self-hosted Python deployment.
+
+---
 
 ## Repository Structure
+
+* **overpass-query.overpassql** | The OverpassQL query for NYC restaurant POIs. 
+
+* **dbscan_anomaly_detection.py** | Original scikit-learn DBSCAN reference (standalone / self-hosted only). 
+
+* **dbscan_anomaly_detection.js** | JS port that runs in the n8n **Code** node. 
 
 * **dbscan_analysis.py** - Production-ready Python script utilizing pandas, numpy, and scikit-learn to process coordinate geometry.
 
