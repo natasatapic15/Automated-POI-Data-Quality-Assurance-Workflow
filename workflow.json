@@ -1,0 +1,205 @@
+{
+  "name": "Automated POI Data Quality Assurance (NYC Restaurants)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "weeks",
+              "triggerAtDay": [
+                1
+              ],
+              "triggerAtHour": 6
+            }
+          ]
+        }
+      },
+      "id": "82aca96b-4641-4e4b-9fe1-aa696985833b",
+      "name": "Weekly Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://overpass-api.de/api/interpreter",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "text/plain",
+        "body": "[out:json][timeout:180];\n\n// 1. Locate the boundary area for New York City\narea[\"wikidata\"=\"Q60\"]->.nyc;\n\n// 2. Gather all restaurant nodes and ways inside that area\n(\n  node(area.nyc)[\"amenity\"=\"restaurant\"];\n  way(area.nyc)[\"amenity\"=\"restaurant\"];\n);\n\n// 3. Output the results with center coordinates for map areas\nout center;",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 180000
+        }
+      },
+      "id": "39f827d2-b8b5-4edc-9000-91f66ef1bfb2",
+      "name": "Fetch NYC Restaurants (Overpass)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        224,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Faithful JS port of the scikit-learn haversine DBSCAN\n// eps = 100 m, min_samples = 5, noise points (cluster = -1) = anomalies\n\nconst elements = ($input.first().json.elements) || [];\n\n// Build clean POI rows. Ways use center coords; nodes use lat/lon directly.\nconst points = [];\nfor (const el of elements) {\n  let lat = el.lat;\n  let lon = el.lon;\n  if ((lat === undefined || lon === undefined) && el.center) {\n    lat = el.center.lat;\n    lon = el.center.lon;\n  }\n  if (typeof lat !== 'number' || typeof lon !== 'number') continue;\n  const name = (el.tags && el.tags.name) ? el.tags.name : 'Unknown';\n  points.push({ id: el.id, lat, lon, name });\n}\n\nconst n = points.length;\n\n// Haversine distance in km\nconst R = 6371.0088;\nfunction toRad(d) { return (d * Math.PI) / 180; }\nfunction haversineKm(a, b) {\n  const dLat = toRad(b.lat - a.lat);\n  const dLon = toRad(b.lon - a.lon);\n  const lat1 = toRad(a.lat);\n  const lat2 = toRad(b.lat);\n  const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;\n  return 2 * R * Math.asin(Math.sqrt(h));\n}\n\nconst epsKm = 0.1;        // 100 meters\nconst minSamples = 5;     // matches min_samples=5 (point itself counted, as in sklearn)\n\n// Spatial grid index for neighbor lookups (cell ~ eps in degrees)\nconst epsDegLat = epsKm / 110.574;\nconst grid = new Map();\nfunction cellKey(ci, cj) { return ci + '|' + cj; }\nfunction lonCellSize(lat) {\n  const kmPerDegLon = 111.320 * Math.cos(toRad(lat));\n  return kmPerDegLon > 0 ? epsKm / kmPerDegLon : epsDegLat;\n}\nfor (let i = 0; i < n; i++) {\n  const p = points[i];\n  const ci = Math.floor(p.lat / epsDegLat);\n  const cj = Math.floor(p.lon / lonCellSize(p.lat));\n  const k = cellKey(ci, cj);\n  if (!grid.has(k)) grid.set(k, []);\n  grid.get(k).push(i);\n}\n\nfunction regionQuery(idx) {\n  const p = points[idx];\n  const ci = Math.floor(p.lat / epsDegLat);\n  const lonSize = lonCellSize(p.lat);\n  const cj = Math.floor(p.lon / lonSize);\n  const neighbors = [];\n  for (let di = -1; di <= 1; di++) {\n    for (let dj = -1; dj <= 1; dj++) {\n      const bucket = grid.get(cellKey(ci + di, cj + dj));\n      if (!bucket) continue;\n      for (const j of bucket) {\n        if (haversineKm(p, points[j]) <= epsKm) neighbors.push(j);\n      }\n    }\n  }\n  return neighbors;\n}\n\n// DBSCAN labels: undefined = unvisited, -1 = noise, >=0 = cluster id\nconst labels = new Array(n).fill(undefined);\nlet clusterId = -1;\nfor (let i = 0; i < n; i++) {\n  if (labels[i] !== undefined) continue;\n  const neighbors = regionQuery(i);\n  if (neighbors.length < minSamples) {\n    labels[i] = -1; // mark as noise (may be reassigned later)\n    continue;\n  }\n  clusterId++;\n  labels[i] = clusterId;\n  const seeds = neighbors.filter((x) => x !== i);\n  let qi = 0;\n  while (qi < seeds.length) {\n    const q = seeds[qi++];\n    if (labels[q] === -1) labels[q] = clusterId; // border point\n    if (labels[q] !== undefined) continue;\n    labels[q] = clusterId;\n    const qNeighbors = regionQuery(q);\n    if (qNeighbors.length >= minSamples) {\n      for (const nb of qNeighbors) {\n        if (labels[nb] === undefined || labels[nb] === -1) seeds.push(nb);\n      }\n    }\n  }\n}\n\n// Anomalies = noise points (label -1)\nconst anomalies = [];\nfor (let i = 0; i < n; i++) {\n  if (labels[i] === -1) {\n    anomalies.push({ id: points[i].id, lat: points[i].lat, lon: points[i].lon, name: points[i].name });\n  }\n}\n\nreturn [{\n  json: {\n    total_pois: n,\n    anomalies_detected: anomalies.length > 0,\n    anomaly_count: anomalies.length,\n    anomalies,\n    run_date: new Date().toISOString(),\n  },\n}];"
+      },
+      "id": "ee93956d-2272-4be4-abd0-c04acb955703",
+      "name": "DBSCAN Anomaly Detection",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        448,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $input.first().json;\nconst date = (d.run_date || new Date().toISOString()).slice(0, 10);\nconst sample = (d.anomalies || []).slice(0, 25);\n\nlet table = '';\nif (sample.length) {\n  table += '| ID | Name | Lat | Lon |\\n|---|---|---|---|\\n';\n  for (const a of sample) {\n    table += '| ' + a.id + ' | ' + (a.name || 'Unknown') + ' | ' + a.lat.toFixed(6) + ' | ' + a.lon.toFixed(6) + ' |\\n';\n  }\n} else {\n  table = '_No spatial anomalies detected this run._\\n';\n}\n\nconst markdown =\n'# POI Data Quality Report — NYC Restaurants\\n\\n' +\n'**Run date:** ' + date + '\\n\\n' +\n'**Total POIs analyzed:** ' + d.total_pois + '\\n\\n' +\n'**Spatial anomalies (DBSCAN noise, eps=100m, minPts=5):** ' + d.anomaly_count + '\\n\\n' +\n'## Anomalies' + (d.anomaly_count > 25 ? ' (showing first 25 of ' + d.anomaly_count + ')' : '') + '\\n\\n' +\ntable;\n\nconst slackText =\n':round_pushpin: *POI Data Quality — NYC Restaurants* (' + date + ')\\n' +\n'• Total POIs analyzed: *' + d.total_pois + '*\\n' +\n'• Spatial anomalies detected: *' + d.anomaly_count + '*\\n' +\n(d.anomaly_count > 0\n  ? '• Top examples: ' + sample.slice(0, 5).map((a) => a.name + ' (' + a.id + ')').join(', ')\n  : '• No anomalies this run :white_check_mark:');\n\nreturn [{\n  json: {\n    markdown,\n    slackText,\n    anomaly_count: d.anomaly_count,\n    total_pois: d.total_pois,\n    date,\n  },\n}];"
+      },
+      "id": "0e93a16b-82bc-46a6-ad4a-b9022963e008",
+      "name": "Build Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        672,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "file",
+        "owner": {
+          "__rl": true,
+          "mode": "name",
+          "value": "natasatapic15"
+        },
+        "repository": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Automated-POI-Data-Quality-Assurance-Workflow"
+        },
+        "filePath": "=reports/poi-anomalies-{{ $json.date }}.md",
+        "fileContent": "={{ $json.markdown }}",
+        "commitMessage": "=chore(report): POI anomaly report for {{ $json.date }} ({{ $json.anomaly_count }} anomalies)",
+        "additionalParameters": {
+          "branch": {
+            "branch": "main"
+          }
+        }
+      },
+      "id": "48760c02-ef8d-4c17-b4ff-fd95c99af1c1",
+      "name": "Commit Report to GitHub",
+      "type": "n8n-nodes-base.github",
+      "typeVersion": 1.1,
+      "position": [
+        896,
+        0
+      ],
+      "webhookId": "37dd8550-c46f-402e-8ebe-1a7e22262a14"
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "#data-quality-alerts"
+        },
+        "text": "={{ $(\"Build Report\").item.json.slackText }}",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "id": "3260aed6-598f-44cf-bdc8-2ccc88635b31",
+      "name": "Post Report to Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.5,
+      "position": [
+        1120,
+        0
+      ],
+      "webhookId": "102a1672-cffc-49e9-a218-aef9dba3cff0"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Weekly Trigger": {
+      "main": [
+        [
+          {
+            "node": "Fetch NYC Restaurants (Overpass)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch NYC Restaurants (Overpass)": {
+      "main": [
+        [
+          {
+            "node": "DBSCAN Anomaly Detection",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DBSCAN Anomaly Detection": {
+      "main": [
+        [
+          {
+            "node": "Build Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Report": {
+      "main": [
+        [
+          {
+            "node": "Commit Report to GitHub",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Commit Report to GitHub": {
+      "main": [
+        [
+          {
+            "node": "Post Report to Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "44d9338b-1974-4dee-ac56-7510bb354fb0",
+  "meta": {
+    "instanceId": "af25d93f33073a611e6f53354f77fae98aed32162914efda76dea64cfcab4e44"
+  },
+  "nodeGroups": [],
+  "id": "MZxbzQJGqR8RD8XG",
+  "tags": []
+}
